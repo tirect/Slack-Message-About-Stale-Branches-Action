@@ -1,0 +1,13 @@
+{
+  "extends": "tslint:recommended",
+  "rules": {
+    "semicolon": [true, "always"],
+    "quotemark": [true, "single"],
+    "indent": [true, "spaces", 2],
+    "object-literal-sort-keys": false,
+    "no-console": false
+  },
+  "linterOptions": {
+    "exclude": ["node_modules/**"]
+  }
+}

@@ -1,0 +1,20 @@
+name: Stale Branch Notifier
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  stale-branch-notifier:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+      - name: Install Dependencies
+        run: yarn install
+      - name: Build
+        run: yarn build
+      - name: Run Action
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: node lib/index.js
