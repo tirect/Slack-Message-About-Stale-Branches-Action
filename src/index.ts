@@ -69,9 +69,11 @@ async function run() {
                 message += `\`${staleBranch.name}\` - stale by ${parseTime(staleBranch.daysSinceLastCommit)}\n`;
             }
             message += "\n\n====================\n\n"
-            const payload = JSON.stringify({text: message});
-            // send the message to Slack using the webhook URL
-            await axios.default.post(slackWebhookUrl, payload);
+            
+            console.log(message);
+            
+            // const payload = JSON.stringify({text: message});
+            // await axios.default.post(slackWebhookUrl, payload);
         }
     } catch
         (error: any) {
