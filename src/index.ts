@@ -1,7 +1,11 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import * as axios from "axios";
+import {GitHub} from "@actions/github/lib/utils";
+import { Endpoints } from "@octokit/types";
 
+// Define the type for a branch
+type Branch = Endpoints["GET /repos/{owner}/{repo}/branches"]["response"]["data"][number];
 
 async function run() {
     try {
@@ -17,17 +21,12 @@ async function run() {
         const octokit = github.getOctokit(process.env.STALE_BRANCH_TOKEN);
         const {owner, repo} = github.context.repo;
 
-        const staleBranchesResponse = await octokit.rest.repos.listBranches({
-            owner,
-            repo,
-            protected: false,
-            per_page: 100,
-        });
+        const staleBranchesResponse = await getAllBranches(octokit, owner, repo);
 
         const staleBranchesByAuthor: { [key: string]: any[] } = {};
 
         const staleBranches = await Promise.all(
-            staleBranchesResponse.data.map(async (branch) => {
+            staleBranchesResponse.map(async (branch) => {
                 const daysSinceLastCommit = await getDaysSinceLastCommit(branch.commit.sha);
                 return {
                     branch: branch,
@@ -78,6 +77,27 @@ async function run() {
         (error: any) {
         core.setFailed(error.message);
     }
+}
+
+async function getAllBranches(octokit: ReturnType<typeof github.getOctokit>, owner: string, repo: string): Promise<Branch[]> {
+    let branches: Branch[] = [];
+    let page = 1;
+    let response;
+
+    do {
+        response = await octokit.rest.repos.listBranches({
+            owner,
+            repo,
+            protected: false,
+            per_page: 100,
+            page: page,
+        });
+
+        branches = branches.concat(response.data);
+        page += 1;
+    } while (response.data.length === 100);
+
+    return branches;
 }
 
 function getSlackUsername(gitUsername: string): string {
