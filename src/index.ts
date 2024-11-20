@@ -1,16 +1,15 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import * as axios from "axios";
-import {GitHub} from "@actions/github/lib/utils";
+import { GitHub } from "@actions/github/lib/utils";
 import { Endpoints } from "@octokit/types";
 
-// Define the type for a branch
 type Branch = Endpoints["GET /repos/{owner}/{repo}/branches"]["response"]["data"][number];
 
 async function run() {
     try {
         const daysBeforeStale = parseInt(
-            core.getInput("days-before-stale", {required: true})
+            core.getInput("days-before-stale", { required: true })
         );
         const slackWebhookUrl = core.getInput("slack-webhook-url", {
             required: true,
@@ -19,44 +18,49 @@ async function run() {
             throw new Error('STALE_BRANCH_TOKEN environment variable is not defined');
         }
         const octokit = github.getOctokit(process.env.STALE_BRANCH_TOKEN);
-        const {owner, repo} = github.context.repo;
+        const { owner, repo } = github.context.repo;
 
-        const staleBranchesResponse = await getAllBranches(octokit, owner, repo);
+        const branches = await getAllBranches(octokit, owner, repo);
 
         const staleBranchesByAuthor: { [key: string]: any[] } = {};
+        const now = Date.now();
 
-        const staleBranches = await Promise.all(
-            staleBranchesResponse.map(async (branch) => {
-                const daysSinceLastCommit = await getDaysSinceLastCommit(branch.commit.sha);
-                return {
-                    branch: branch,
-                    daysSinceLastCommit: daysSinceLastCommit,
-                };
-            })
-        ).then((branches) =>
-            branches.filter((branch) => branch.daysSinceLastCommit >= daysBeforeStale)
-        );
+        // Process branches in batches
+        const batchSize = 10;
+        for (let i = 0; i < branches.length; i += batchSize) {
+            const batchBranches = branches.slice(i, i + batchSize);
 
-        for (const staleBranch of staleBranches) {
-            const branchName = staleBranch.branch.name;
+            await Promise.all(
+                batchBranches.map(async (branch) => {
+                    try {
+                        const commitInfo = await makeRequestWithRetry(() =>
+                            octokit.rest.repos.getCommit({
+                                owner,
+                                repo,
+                                ref: branch.commit.sha,
+                            })
+                        );
 
-            const branchOwnerResponse = await octokit.rest.repos.getBranch({
-                owner,
-                repo,
-                branch: branchName,
-            });
+                        const commitDate = new Date(commitInfo.data.commit.committer?.date || '');
+                        const daysSinceLastCommit = (now - commitDate.getTime()) / (1000 * 60 * 60 * 24);
 
-            const branchOwner =
-                branchOwnerResponse.data.commit.author?.login || "UNKNOWN";
+                        if (daysSinceLastCommit >= daysBeforeStale) {
+                            const author = commitInfo.data.author?.login || "UNKNOWN";
 
-            if (!staleBranchesByAuthor[branchOwner]) {
-                staleBranchesByAuthor[branchOwner] = [];
-            }
+                            if (!staleBranchesByAuthor[author]) {
+                                staleBranchesByAuthor[author] = [];
+                            }
 
-            staleBranchesByAuthor[branchOwner].push({
-                name: branchName,
-                daysSinceLastCommit: staleBranch.daysSinceLastCommit,
-            });
+                            staleBranchesByAuthor[author].push({
+                                name: branch.name,
+                                daysSinceLastCommit: daysSinceLastCommit,
+                            });
+                        }
+                    } catch (error) {
+                        core.warning(`Failed to process branch ${branch.name}: ${error}`);
+                    }
+                })
+            );
         }
 
         for (const author in staleBranchesByAuthor) {
@@ -70,32 +74,72 @@ async function run() {
             }
             message += "\n\n====================\n\n"
 
-            const payload = JSON.stringify({text: message});
+            const payload = JSON.stringify({ text: message });
             await axios.default.post(slackWebhookUrl, payload);
         }
-    } catch
-        (error: any) {
+    } catch (error: any) {
         core.setFailed(error.message);
     }
 }
 
+async function makeRequestWithRetry<T>(
+    request: () => Promise<T>,
+    maxRetries = 5
+): Promise<T> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await request();
+        } catch (error: any) {
+            if (attempt === maxRetries) throw error;
+
+            // Check for rate limit response
+            if (error.response?.status === 403) {
+                const retryAfter = error.response.headers['retry-after'];
+                if (retryAfter) {
+                    const waitTime = parseInt(retryAfter) * 1000; // Convert to milliseconds
+                    core.info(`Rate limited. Waiting ${retryAfter} seconds before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                    continue;
+                }
+            }
+
+            // For other errors or no retry-after header, use exponential backoff
+            const waitTime = Math.pow(2, attempt) * 1000;
+            core.info(`Request failed. Retrying in ${waitTime/1000} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+
 async function getAllBranches(octokit: ReturnType<typeof github.getOctokit>, owner: string, repo: string): Promise<Branch[]> {
-    let branches: Branch[] = [];
+    const branches: Branch[] = [];
     let page = 1;
-    let response;
+    const per_page = 100;
 
-    do {
-        response = await octokit.rest.repos.listBranches({
-            owner,
-            repo,
-            protected: false,
-            per_page: 100,
-            page: page,
-        });
+    try {
+        while (true) {
+            const response = await makeRequestWithRetry(() =>
+                octokit.rest.repos.listBranches({
+                    owner,
+                    repo,
+                    protected: false,
+                    per_page,
+                    page,
+                })
+            );
 
-        branches = branches.concat(response.data);
-        page += 1;
-    } while (response.data.length === 100);
+            branches.push(...response.data);
+
+            if (response.data.length < per_page) {
+                break;
+            }
+
+            page++;
+        }
+    } catch (error) {
+        core.warning(`Error fetching branches: ${error}`);
+    }
 
     return branches;
 }
@@ -106,6 +150,7 @@ function getSlackUsername(gitUsername: string): string {
     );
     return slackUsers[gitUsername] + ` (${gitUsername})` || "@" + gitUsername;
 }
+
 function parseTime(days: number): string {
     const years = Math.floor(days / 365);
     const months = Math.floor((days % 365) / 30);
@@ -130,35 +175,6 @@ function parseTime(days: number): string {
     }
 
     return timeFormat.trim();
-}
-
-async function getDaysSinceLastCommit(sha: string): Promise<number> {
-    if (typeof process.env.STALE_BRANCH_TOKEN === 'undefined') {
-        throw new Error('STALE_BRANCH_TOKEN environment variable is not defined');
-    }
-    const octokit = github.getOctokit(process.env.STALE_BRANCH_TOKEN);
-    const {owner, repo} = github.context.repo;
-    const commitResponse = await octokit.rest.repos.getCommit({
-        owner,
-        repo,
-        ref: sha,
-        per_page: 1,
-        page: 1
-    });
-
-    const commitDate = commitResponse?.data?.commit?.committer?.date !== undefined
-        ? new Date(commitResponse.data.commit.committer.date)
-        : undefined;
-
-    if (!commitDate) {
-        return -1;
-    }
-
-    const daysSinceLastCommit =
-        (Date.now() - new Date(commitDate).getTime()) /
-        (1000 * 60 * 60 * 24);
-
-    return daysSinceLastCommit;
 }
 
 run();
